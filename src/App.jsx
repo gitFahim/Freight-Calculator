@@ -10,7 +10,10 @@ import {
   Download,
   AlertTriangle,
   X,
-  Info
+  Info,
+  Upload,
+  FileSpreadsheet,
+  Edit2
 } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
@@ -18,9 +21,8 @@ import * as XLSX from 'xlsx';
 const App = () => {
   // --- State ---
   const [globalSettings, setGlobalSettings] = useState({
-    cnToCnRate: 0,   // RMB
-    cnToBdRate: 0,   // Local (BDT)
-    bdToBdRate: 0,   // Local (BDT)
+    cnToCnCost: 0,   // Total RMB for the box (Fixed)
+    cnToBdRate: 0,   // Local (BDT) per KG
     currencyRate: 1, // RMB to Local conversion
     otherCost: 0,    // Local (BDT)
     totalBoxWeight: 0,
@@ -31,11 +33,12 @@ const App = () => {
     sn: '',
     name: '',
     weight: '',
-    weightUnit: 'kg', // 'kg' or 'gram'
+    weightUnit: 'gram', // 'kg' or 'gram' (Default: gram)
     cost: '',
     quantity: ''
   });
 
+  const [editingId, setEditingId] = useState(null); // Track which product is being edited
   const [showOverweightPopup, setShowOverweightPopup] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
 
@@ -45,9 +48,11 @@ const App = () => {
     if (savedData) {
       try {
         const parsed = JSON.parse(savedData);
+        // Migration: map old cnToCnRate to new cnToCnCost if needed, or just default to 0
         setGlobalSettings(prev => ({
           ...prev,
-          ...parsed.globalSettings
+          ...parsed.globalSettings,
+          cnToCnCost: parsed.globalSettings.cnToCnCost ?? parsed.globalSettings.cnToCnRate ?? 0
         }));
         setProducts(parsed.products || []);
       } catch (e) {
@@ -86,21 +91,118 @@ const App = () => {
       weightInKg = weightInKg / 1000;
     }
 
-    const product = {
-      id: crypto.randomUUID(),
-      sn: newProduct.sn || (products.length + 1).toString(),
+    const payload = {
+      sn: newProduct.sn,
       name: newProduct.name,
-      weight: weightInKg,
+      weight: weightInKg, // Store in KG
       cost: parseFloat(newProduct.cost),
       quantity: parseInt(newProduct.quantity)
     };
 
-    setProducts([...products, product]);
-    setNewProduct({ sn: '', name: '', weight: '', weightUnit: 'kg', cost: '', quantity: '' });
+    if (editingId) {
+      // Update existing
+      setProducts(products.map(p => p.id === editingId ? { ...p, ...payload } : p));
+      setEditingId(null);
+    } else {
+      // Create new
+      const product = {
+        id: crypto.randomUUID(),
+        sn: payload.sn || (products.length + 1).toString(),
+        ...payload
+      };
+      setProducts([...products, product]);
+    }
+
+    setNewProduct({ sn: '', name: '', weight: '', weightUnit: 'gram', cost: '', quantity: '' });
+  };
+
+  const startEdit = (product) => {
+    setEditingId(product.id);
+    let displayWeight = product.weight;
+    let displayUnit = 'kg';
+
+    // Simple heuristic: if weight is small (< 1kg) and likely intended as grams, show as grams
+    // Or just strictly convert if it was originally grams? 
+    // For now, let's just keep it simple: always load as KG unless user changes it, 
+    // OR if we want to be fancy, check if it's a clean gram number.
+    // Let's stick to standard KG for edit to avoid confusion, or convert to grams if < 1.
+    if (product.weight < 1) {
+      displayWeight = product.weight * 1000;
+      displayUnit = 'gram';
+    }
+
+    setNewProduct({
+      sn: product.sn,
+      name: product.name,
+      weight: displayWeight.toString(),
+      weightUnit: displayUnit,
+      cost: product.cost.toString(),
+      quantity: product.quantity.toString()
+    });
+
+    // Scroll to form
+    document.querySelector('form')?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setNewProduct({ sn: '', name: '', weight: '', weightUnit: 'gram', cost: '', quantity: '' });
+  };
+
+  const handleImport = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const bstr = evt.target.result;
+        const wb = XLSX.read(bstr, { type: 'binary' });
+        const wsName = wb.SheetNames[0];
+        const ws = wb.Sheets[wsName];
+        const data = XLSX.utils.sheet_to_json(ws);
+
+        const newProducts = data.map((row, idx) => {
+          let weight = parseFloat(row.Weight || 0);
+          const unit = row.Unit ? row.Unit.toLowerCase() : 'kg';
+          if (unit === 'g' || unit === 'gram' || unit === 'grams') {
+            weight = weight / 1000;
+          }
+
+          return {
+            id: crypto.randomUUID(),
+            sn: row.SKU ? row.SKU.toString() : (products.length + idx + 1).toString(),
+            name: row.Name || 'Unknown Product',
+            weight: weight,
+            cost: parseFloat(row.Cost || 0),
+            quantity: parseInt(row.Quantity || 1)
+          };
+        }).filter(p => p.name && p.weight > 0);
+
+        setProducts(prev => [...prev, ...newProducts]);
+        alert(`Successfully imported ${newProducts.length} products.`);
+      } catch (err) {
+        console.error(err);
+        alert("Failed to parse file. Please ensure it matches the template.");
+      }
+    };
+    reader.readAsBinaryString(file);
+    e.target.value = null; // Reset input
+  };
+
+  const downloadTemplate = () => {
+    const ws = XLSX.utils.json_to_sheet([
+      { SKU: '001', Name: 'Sample Product', Weight: 0.5, Unit: 'kg', Cost: 50, Quantity: 10 },
+      { SKU: '002', Name: 'Small Item', Weight: 500, Unit: 'gram', Cost: 10, Quantity: 5 }
+    ]);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Template");
+    XLSX.writeFile(wb, "Freight_Template.xlsx");
   };
 
   const removeProduct = (id) => {
     setProducts(products.filter(p => p.id !== id));
+    if (editingId === id) cancelEdit();
   };
 
   const clearAll = () => {
@@ -137,10 +239,15 @@ const App = () => {
 
       // --- Shipping Costs Calculation (2 Parts) ---
 
-      // 1. Supplier -> CN Wirehouse (RMB -> Local)
-      const costCnToCn = (unitGrossWeight * globalSettings.cnToCnRate) * globalSettings.currencyRate;
+      // 1. Supplier -> CN Wirehouse (Fixed Box Cost Distributed by Weight)
+      // Share = (Unit Gross Weight / Total Box Weight) * Total Box Cost
+      const unitWeightShare = globalSettings.totalBoxWeight > 0
+        ? unitGrossWeight / globalSettings.totalBoxWeight
+        : 0;
 
-      // 2. CN -> BD (Already Local)
+      const costCnToCn = (unitWeightShare * globalSettings.cnToCnCost) * globalSettings.currencyRate;
+
+      // 2. CN -> BD (Per KG Rate)
       const costCnToBd = unitGrossWeight * globalSettings.cnToBdRate;
 
       // Total Shipping for this unit
@@ -148,9 +255,6 @@ const App = () => {
 
       // --- Other Costs ---
       // Distributed based on weight share
-      const unitWeightShare = globalSettings.totalBoxWeight > 0
-        ? unitGrossWeight / globalSettings.totalBoxWeight
-        : 0;
       const allocatedOtherCost = unitWeightShare * globalSettings.otherCost;
 
       // Per Product Extra Cost (Shipping + Other)
@@ -161,6 +265,7 @@ const App = () => {
 
       // Total Product Cost (Line Total)
       const totalLineCost = unitGrossCost * product.quantity;
+      const totalRmbParams = product.cost * product.quantity;
 
       return {
         ...product,
@@ -173,7 +278,8 @@ const App = () => {
         allocatedOtherCost,
         unitExtraCost,
         unitGrossCost,
-        totalLineCost
+        totalLineCost,
+        totalRmbParams
       };
     });
 
@@ -181,6 +287,7 @@ const App = () => {
     const totalGrossCost = processedProducts.reduce((sum, p) => sum + p.totalLineCost, 0);
     const totalShippingCost = processedProducts.reduce((sum, p) => sum + (p.totalShippingCost * p.quantity), 0);
     const totalOtherCost = processedProducts.reduce((sum, p) => sum + (p.allocatedOtherCost * p.quantity), 0);
+    const totalRmbParams = processedProducts.reduce((sum, p) => sum + p.totalRmbParams, 0);
 
     return {
       totalNetWeight,
@@ -188,7 +295,8 @@ const App = () => {
       processedProducts,
       totalGrossCost,
       totalShippingCost,
-      totalOtherCost
+      totalOtherCost,
+      totalRmbParams
     };
   }, [products, globalSettings]);
 
@@ -205,13 +313,14 @@ const App = () => {
   // --- Export Functions ---
   const getExportData = () => {
     return calculations.processedProducts.map(p => ({
-      SKU: p.sn,
       Product: p.name,
-      'Base Cost (RMB)': parseFloat(p.cost.toFixed(2)), // Fix precision
+      Qty: p.quantity,
+      'Unit Price (RMB)': parseFloat(p.cost.toFixed(2)),
+      'Total Price (RMB)': parseFloat(p.totalRmbParams.toFixed(2)),
+      SKU: p.sn,
       'Gross Weight (KG)': parseFloat(p.unitGrossWeight.toFixed(3)),
       'Shipment Cost (BDT)': parseFloat(p.totalShippingCost.toFixed(2)),
       'Extra Cost (BDT)': parseFloat(p.allocatedOtherCost.toFixed(2)),
-      Qty: p.quantity,
       'Total Cost (BDT)': parseFloat(p.totalLineCost.toFixed(2)),
       'Per Unit Price (BDT)': parseFloat(p.unitGrossCost.toFixed(2))
     }));
@@ -284,12 +393,36 @@ const App = () => {
             </h1>
             <p className="text-slate-500 mt-1">International shipment cost distribution & pricing.</p>
           </div>
-          <button
-            onClick={clearAll}
-            className="flex items-center gap-2 text-sm text-red-600 hover:bg-red-50 px-3 py-2 rounded-lg transition-colors"
-          >
-            <RefreshCcw className="w-4 h-4" /> Reset
-          </button>
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <input
+                type="file"
+                id="import-file"
+                accept=".xlsx, .xls, .csv"
+                className="hidden"
+                onChange={handleImport}
+              />
+              <button
+                onClick={() => document.getElementById('import-file').click()}
+                className="flex items-center gap-2 text-sm text-blue-600 hover:bg-blue-50 px-3 py-2 rounded-lg transition-colors border border-blue-100"
+              >
+                <Upload className="w-4 h-4" /> Import
+              </button>
+            </div>
+            <button
+              onClick={downloadTemplate}
+              title="Download Import Template"
+              className="text-slate-400 hover:text-blue-600 p-2 rounded-lg transition-colors"
+            >
+              <FileSpreadsheet className="w-5 h-5" />
+            </button>
+            <button
+              onClick={clearAll}
+              className="flex items-center gap-2 text-sm text-red-600 hover:bg-red-50 px-3 py-2 rounded-lg transition-colors"
+            >
+              <RefreshCcw className="w-4 h-4" /> Reset
+            </button>
+          </div>
         </header>
 
         {/* Main Grid */}
@@ -327,32 +460,38 @@ const App = () => {
                 {/* Shipping Rates Group */}
                 <div className="space-y-3 pb-4 border-b border-slate-100">
                   <label className="block text-xs font-semibold uppercase tracking-wider text-slate-500">
-                    Shipping Rates (Per KG)
+                    Shipping Rates
                   </label>
 
                   <div className="grid grid-cols-1 gap-3">
                     <div className="relative">
+                      <label className="text-[10px] text-slate-400 font-medium mb-1 block">
+                        Supplier -&gt; CN Wirehouse (Total Box Cost)
+                      </label>
                       <input
                         type="number"
-                        name="cnToCnRate"
-                        value={globalSettings.cnToCnRate || ''}
+                        name="cnToCnCost"
+                        value={globalSettings.cnToCnCost || ''}
                         onChange={handleGlobalChange}
-                        placeholder="Supplier -> CN Wirehouse"
+                        placeholder="Total RMB"
                         className="w-full pl-4 pr-12 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
                       />
-                      <span className="absolute right-3 top-2.5 text-xs font-bold text-slate-400">RMB</span>
+                      <span className="absolute right-3 top-8 text-xs font-bold text-slate-400">RMB</span>
                     </div>
 
                     <div className="relative">
+                      <label className="text-[10px] text-slate-400 font-medium mb-1 block">
+                        CN -&gt; BD (Per KG Rate)
+                      </label>
                       <input
                         type="number"
                         name="cnToBdRate"
                         value={globalSettings.cnToBdRate || ''}
                         onChange={handleGlobalChange}
-                        placeholder="CN -> BD"
+                        placeholder="Per KG BDT"
                         className="w-full pl-4 pr-12 py-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none"
                       />
-                      <span className="absolute right-3 top-2.5 text-xs font-bold text-slate-400">BDT</span>
+                      <span className="absolute right-3 top-8 text-xs font-bold text-slate-400">BDT</span>
                     </div>
                   </div>
                 </div>
@@ -400,11 +539,18 @@ const App = () => {
               </div>
             </div>
 
-            {/* Add Product Form */}
-            <form onSubmit={addProduct} className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-              <div className="bg-blue-600 px-6 py-4 border-b border-blue-700 flex items-center gap-2">
-                <Plus className="w-5 h-5 text-blue-100" />
-                <h2 className="font-semibold text-white">Add Product</h2>
+            {/* Add/Edit Product Form */}
+            <form onSubmit={addProduct} className={`bg-white rounded-2xl shadow-sm border ${editingId ? 'border-amber-200 ring-4 ring-amber-50' : 'border-slate-200'} overflow-hidden transition-all duration-300`}>
+              <div className={`${editingId ? 'bg-amber-500 border-amber-600' : 'bg-blue-600 border-blue-700'} px-6 py-4 border-b flex items-center justify-between`}>
+                <div className="flex items-center gap-2">
+                  {editingId ? <Edit2 className="w-5 h-5 text-white" /> : <Plus className="w-5 h-5 text-blue-100" />}
+                  <h2 className="font-semibold text-white">{editingId ? 'Edit Product' : 'Add Product'}</h2>
+                </div>
+                {editingId && (
+                  <button type="button" onClick={cancelEdit} className="text-white/80 hover:text-white">
+                    <X className="w-5 h-5" />
+                  </button>
+                )}
               </div>
               <div className="p-6 space-y-4">
                 <div className="grid grid-cols-2 gap-4">
@@ -445,9 +591,24 @@ const App = () => {
                   </div>
                 </div>
 
-                <button type="submit" className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-lg transition-colors flex items-center justify-center gap-2 mt-2">
-                  <Plus className="w-4 h-4" /> Add to Shipment
-                </button>
+                <div className="flex gap-2 mt-2">
+                  {editingId && (
+                    <button
+                      type="button"
+                      onClick={cancelEdit}
+                      className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-600 font-semibold py-2.5 rounded-lg transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    className={`flex-1 ${editingId ? 'bg-amber-500 hover:bg-amber-600' : 'bg-blue-600 hover:bg-blue-700'} text-white font-semibold py-2.5 rounded-lg transition-colors flex items-center justify-center gap-2`}
+                  >
+                    {editingId ? <Edit2 className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+                    {editingId ? 'Update Product' : 'Add to Shipment'}
+                  </button>
+                </div>
               </div>
             </form>
 
@@ -505,7 +666,7 @@ const App = () => {
                     {showExportMenu && (
                       <>
                         <div className="fixed inset-0 z-10" onClick={() => setShowExportMenu(false)}></div>
-                        <div className="absolute right-0 top-full mt-1 w-32 bg-white rounded-lg shadow-lg border border-slate-100 py-1 z-20 flex flex-col">
+                        <div className="absolute right-0 top-full mt-1 w-32 bg-white rounded-lg shadow-lg border border-slate-100 py-1 z-20 flex flex-col cursor-pointer">
                           <button onClick={exportToExcel} className="text-left px-3 py-2 text-xs text-slate-700 hover:bg-slate-50 hover:text-blue-600 transition-colors">
                             Download Excel
                           </button>
@@ -529,69 +690,86 @@ const App = () => {
                 ) : (
                   <table className="w-full text-left border-collapse">
                     <thead>
-                      <tr className="bg-slate-50 text-xs text-slate-500 uppercase tracking-wider border-b border-slate-200">
-                        <th className="px-4 py-3 font-semibold">Product</th>
-                        <th className="px-4 py-3 font-semibold text-right">Gross Weight<br /><span className="normal-case text-[10px] text-slate-400">(Net + Box Wgt)</span></th>
-                        <th className="px-4 py-3 font-semibold text-right">Shipment Cost<br /><span className="normal-case text-[10px] text-slate-400">(Unit)</span></th>
-                        <th className="px-4 py-3 font-semibold text-right">Extra Cost<br /><span className="normal-case text-[10px] text-slate-400">(Others)</span></th>
-                        <th className="px-4 py-3 font-semibold text-center">Qty</th>
-                        <th className="px-4 py-3 font-semibold text-right">Total Cost</th>
-                        <th className="px-4 py-3 font-semibold text-right">Per Unit Price</th>
-                        <th className="px-2 py-3"></th>
+                      <tr className="bg-slate-50 text-[10px] md:text-xs text-slate-500 uppercase tracking-wider border-b border-slate-200">
+                        <th className="px-2 py-3 font-semibold whitespace-nowrap">Product</th>
+                        <th className="px-2 py-3 font-semibold text-center whitespace-nowrap">Qty</th>
+                        <th className="px-2 py-3 font-semibold text-right whitespace-nowrap">Unit Price<br /><span className="normal-case text-[10px] text-slate-400">(RMB)</span></th>
+                        <th className="px-2 py-3 font-semibold text-right whitespace-nowrap">Total Price<br /><span className="normal-case text-[10px] text-slate-400">(RMB)</span></th>
+                        <th className="px-2 py-3 font-semibold text-right whitespace-nowrap">Gross Weight<br /><span className="normal-case text-[10px] text-slate-400">(Net + Box Wgt)</span></th>
+                        <th className="px-2 py-3 font-semibold text-right whitespace-nowrap">Shipment Cost<br /><span className="normal-case text-[10px] text-slate-400">(Unit)</span></th>
+                        <th className="px-2 py-3 font-semibold text-right whitespace-nowrap">Extra Cost<br /><span className="normal-case text-[10px] text-slate-400">(Others)</span></th>
+                        <th className="px-2 py-3 font-semibold text-right whitespace-nowrap">Total Cost</th>
+                        <th className="px-2 py-3 font-semibold text-right whitespace-nowrap">Per Unit Price</th>
+                        <th className="px-1 py-3"></th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-100">
+                    <tbody className="divide-y divide-slate-100 text-xs md:text-sm">
                       {calculations.processedProducts.map((p) => (
                         <tr key={p.id} className="hover:bg-slate-50 group transition-colors">
-                          <td className="px-4 py-3">
+                          <td className="px-2 py-2">
                             <div className="flex flex-col">
                               <div className="flex items-center gap-2">
                                 <span className="text-xs text-slate-400 font-mono bg-slate-100 px-1 rounded">{p.sn}</span>
                                 <span className="font-medium text-slate-800">{p.name}</span>
                               </div>
-                              <span className="text-[10px] text-slate-400 mt-0.5">Base: {p.cost} RMB</span>
                             </div>
                           </td>
-                          <td className="px-4 py-3 text-right">
-                            <div className="flex flex-col items-end">
-                              <span className="font-medium text-slate-700">{fmtW(p.unitGrossWeight)} kg</span>
-                              <span className="text-[10px] text-slate-400">
-                                {fmtW(p.weight)} + <span className="text-amber-600">{fmtW(p.unitTareWeight)}</span>
-                              </span>
-                            </div>
-                          </td>
-                          <td className="px-4 py-3 text-right">
-                            <span className="text-slate-700 font-medium">{fmt(p.totalShippingCost)}</span>
-                          </td>
-                          <td className="px-4 py-3 text-right">
-                            <span className="text-slate-700 font-medium">{fmt(p.allocatedOtherCost)}</span>
-                          </td>
-                          <td className="px-4 py-3 text-center text-slate-600">
+                          <td className="px-2 py-2 text-center text-slate-600">
                             {p.quantity}
                           </td>
-                          <td className="px-4 py-3 text-right font-bold text-slate-800">
+                          <td className="px-2 py-2 text-right">
+                            <span className="text-slate-600 font-medium">{p.cost}</span>
+                          </td>
+                          <td className="px-2 py-2 text-right">
+                            <span className="text-emerald-600 font-medium">{fmt(p.totalRmbParams)}</span>
+                          </td>
+                          <td className="px-2 py-2 text-right">
+                            <div className="flex flex-col items-end">
+                              <span className="font-medium text-slate-700">{fmtW(p.unitGrossWeight)} kg</span>
+                            </div>
+                          </td>
+                          <td className="px-2 py-2 text-right">
+                            <span className="text-slate-700 font-medium">{fmt(p.totalShippingCost)}</span>
+                          </td>
+                          <td className="px-2 py-2 text-right">
+                            <span className="text-slate-700 font-medium">{fmt(p.allocatedOtherCost)}</span>
+                          </td>
+                          <td className="px-2 py-2 text-right font-bold text-slate-800">
                             {fmt(p.totalLineCost)}
                           </td>
-                          <td className="px-4 py-3 text-right bg-blue-50/50 font-bold text-blue-700">
+                          <td className="px-2 py-2 text-right bg-blue-50/50 font-bold text-blue-700">
                             {fmt(p.unitGrossCost)}
                           </td>
-                          <td className="px-2 py-3 text-right">
-                            <button
-                              onClick={() => removeProduct(p.id)}
-                              className="text-slate-300 hover:text-red-500 p-1 rounded transition-colors"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
+                          <td className="px-1 py-2 text-right">
+                            <div className="flex items-center justify-end gap-1">
+                              <button
+                                onClick={() => startEdit(p)}
+                                className="text-slate-300 hover:text-blue-500 p-1 rounded transition-colors"
+                                title="Edit"
+                              >
+                                <Edit2 className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => removeProduct(p.id)}
+                                className="text-slate-300 hover:text-red-500 p-1 rounded transition-colors"
+                                title="Remove"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       ))}
                     </tbody>
                     <tfoot className="bg-slate-50 border-t border-slate-200">
                       <tr>
-                        <td className="px-4 py-3 font-bold text-slate-600">Totals</td>
-                        <td className="px-4 py-3 text-right font-bold text-slate-600">{fmtW(globalSettings.totalBoxWeight)} kg</td>
-                        <td colSpan="3"></td>
-                        <td className="px-4 py-3 text-right font-bold text-xl text-slate-900">{fmt(calculations.totalGrossCost)}</td>
+                        <td className="px-2 py-3 font-bold text-slate-600">Totals</td>
+                        <td colSpan="2"></td>
+                        <td className="px-2 py-3 text-right font-bold text-emerald-700">{fmt(calculations.totalRmbParams)}</td>
+                        <td className="px-2 py-3 text-right font-bold text-slate-600">{fmtW(globalSettings.totalBoxWeight)} kg</td>
+                        <td className="px-2 py-3 text-right font-bold text-slate-600">{fmt(calculations.totalShippingCost)}</td>
+                        <td colSpan="1"></td>
+                        <td className="px-2 py-3 text-right font-bold text-xl text-slate-900">{fmt(calculations.totalGrossCost)}</td>
                         <td colSpan="2"></td>
                       </tr>
                     </tfoot>
@@ -606,8 +784,8 @@ const App = () => {
               <div className="space-y-1">
                 <p className="font-semibold">Shipping Logic:</p>
                 <ul className="list-disc pl-4 space-y-1 opacity-80">
-                  <li>Supplier to CN Wirehouse cost is calculated in RMB and converted to BDT.</li>
-                  <li>CN to BD costs are calculated directly in BDT.</li>
+                  <li>Supplier to CN Wirehouse is now a <strong>Fixed Box Cost</strong> (RMB), distributed by weight.</li>
+                  <li>CN to BD costs are calculated directly in BDT per KG.</li>
                   <li>All shipping costs are based on the Unit Gross Weight (Product Weight + Proportionate Box Weight).</li>
                 </ul>
               </div>
